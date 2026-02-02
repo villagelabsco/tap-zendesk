@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import json
 import sys, os
+import time
+from collections import deque
+from threading import Lock
 from datetime import datetime
 from zenpy import Zenpy
 import requests
@@ -14,6 +17,13 @@ from tap_zendesk.streams import STREAMS
 from tap_zendesk.sync import sync_stream
 
 LOGGER = singer.get_logger()
+
+# Rate limiter state
+_rate_limiter = {
+    'max_requests_per_minute': None,  # None = disabled
+    'request_times': deque(),
+    'lock': Lock()
+}
 
 REQUIRED_CONFIG_KEYS = [
     "start_date",
@@ -31,13 +41,51 @@ API_TOKEN_CONFIG_KEYS = [
     "api_token",
 ]
 
+def configure_rate_limiter(max_requests_per_minute):
+    """Initialize the rate limiter with the configured limit."""
+    _rate_limiter['max_requests_per_minute'] = int(max_requests_per_minute)
+    LOGGER.info("Rate limiting enabled: %d requests per minute",
+                _rate_limiter['max_requests_per_minute'])
+
+
+def _wait_for_rate_limit():
+    """Block until we can make a request within the rate limit."""
+    max_rpm = _rate_limiter['max_requests_per_minute']
+    if max_rpm is None:
+        return  # Rate limiting disabled
+
+    with _rate_limiter['lock']:
+        now = time.time()
+        window_start = now - 60.0
+
+        # Remove timestamps outside the window
+        while _rate_limiter['request_times'] and _rate_limiter['request_times'][0] < window_start:
+            _rate_limiter['request_times'].popleft()
+
+        # If at limit, wait until oldest request exits the window
+        if len(_rate_limiter['request_times']) >= max_rpm:
+            sleep_time = _rate_limiter['request_times'][0] - window_start
+            if sleep_time > 0:
+                LOGGER.debug("Rate limit reached. Sleeping for %.2f seconds.", sleep_time)
+                time.sleep(sleep_time)
+                # Clean up after sleeping
+                now = time.time()
+                window_start = now - 60.0
+                while _rate_limiter['request_times'] and _rate_limiter['request_times'][0] < window_start:
+                    _rate_limiter['request_times'].popleft()
+
+        # Record this request
+        _rate_limiter['request_times'].append(time.time())
+
+
 # patch Session.request to record HTTP request metrics
-request = Session.request
+_original_request = Session.request
 
 
 def request_metrics_patch(self, method, url, **kwargs):
+    _wait_for_rate_limit()  # Add rate limiting
     with singer_metrics.http_request_timer(None):
-        return request(self, method, url, **kwargs)
+        return _original_request(self, method, url, **kwargs)
 
 Session.request = request_metrics_patch
 # end patch
@@ -215,6 +263,14 @@ def get_session(config):
 @singer.utils.handle_top_exception(LOGGER)
 def main():
     parsed_args = singer.utils.parse_args(REQUIRED_CONFIG_KEYS)
+
+    # Configure rate limiting if specified
+    max_rpm = parsed_args.config.get('max_requests_per_minute')
+    if max_rpm is not None:
+        if max_rpm <= 0:
+            raise ValueError("max_requests_per_minute must be a positive number")
+        configure_rate_limiter(max_rpm)
+
     # OAuth has precedence
     creds = oauth_auth(parsed_args) or api_token_auth(parsed_args)
     session = get_session(parsed_args.config)

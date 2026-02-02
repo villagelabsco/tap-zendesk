@@ -34,7 +34,8 @@ class ZendeskTest(unittest.TestCase):
            'marketplace_app_id': int(os.getenv('TAP_ZENDESK_MARKETPLACE_APP_ID')) or 0,
            'marketplace_name': os.getenv('TAP_ZENDESK_MARKETPLACE_NAME') or "",
            'marketplace_organization_id': int(os.getenv('TAP_ZENDESK_MARKETPLACE_ORGANIZATION_ID')) or 0,
-           'search_window_size':  '2592000'# seconds in a month
+           'search_window_size':  '2592000',# seconds in a month
+           'max_requests_per_minute': 500
         }
 
     def get_credentials(self):
